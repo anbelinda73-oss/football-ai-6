@@ -1,0 +1,6 @@
+services:
+- type: web
+  name: football-ai-6
+  runtime: docker
+  plan: free
+  healthCheckPath: /health
