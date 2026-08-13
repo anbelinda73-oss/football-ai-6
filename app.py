@@ -25,41 +25,52 @@ D.mkdir(exist_ok=True)
 
 model = YOLO(os.getenv("YOLO_MODEL", "yolo26n.pt"))
 
+# 작업 상태 저장
 jobs = {}
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "FOOTBALL AI 6.1",
+        "status": "running",
+        "docs": "/docs"
+    }
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "engine": "YOLO+BoT-SORT",
+        "engine": "YOLO + BoT-SORT",
         "version": "6.1"
     }
 
 
-def process_video(job, inp, out, target_x, target_y, target_time):
-    cap = None
-    writer = None
-
+def run_analysis(job, inp, out, target_x, target_y, target_time):
     try:
-        jobs[job] = {
-            "status": "processing",
-            "progress": 0,
-            "message": "영상 분석을 시작했습니다."
-        }
+        jobs[job] = {"status": "processing", "progress": 0}
 
         cap = cv2.VideoCapture(str(inp))
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         if not W or not H:
-            raise RuntimeError("영상 파일을 읽을 수 없습니다.")
+            jobs[job] = {
+                "status": "error",
+                "message": "영상 파일을 읽을 수 없습니다."
+            }
+            cap.release()
+            return
 
-        px = target_x * W
-        py = target_y * H
+        # 중요:
+        # target_x / target_y는 이미 픽셀 좌표이므로
+        # W, H를 다시 곱하지 않습니다.
+        px = float(target_x)
+        py = float(target_y)
 
         target_frame = int(max(0, target_time) * fps)
 
@@ -98,19 +109,16 @@ def process_video(job, inp, out, target_x, target_y, target_time):
                 for b, tid in zip(boxes, ids):
                     x1, y1, x2, y2 = map(float, b)
 
+                    cx = (x1 + x2) / 2
+                    cy = (y1 + y2) / 2
+
                     cs.append(
-                        (
-                            tid,
-                            x1,
-                            y1,
-                            x2,
-                            y2,
-                            (x1 + x2) / 2,
-                            (y1 + y2) / 2
-                        )
+                        (tid, x1, y1, x2, y2, cx, cy)
                     )
 
+            # 지정한 시간 이후 처음 한 번만 선수 선택
             if i >= target_frame and selected is None and cs:
+
                 inside = [
                     c for c in cs
                     if c[1] <= px <= c[3]
@@ -158,7 +166,7 @@ def process_video(job, inp, out, target_x, target_y, target_time):
                     "26",
                     (int(x1), max(24, int(y1) - 7)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    .75,
+                    0.75,
                     (0, 0, 255),
                     2
                 )
@@ -179,43 +187,32 @@ def process_video(job, inp, out, target_x, target_y, target_time):
 
             i += 1
 
-            if total_frames > 0:
-                progress = int((i / total_frames) * 100)
-
+            if total > 0:
+                progress = int(i / total * 100)
                 jobs[job]["progress"] = min(progress, 99)
 
+        cap.release()
+        writer.release()
+
         if selected is None:
-            raise RuntimeError(
-                "선수 검출 실패: 선수가 잘 보이는 장면에서 "
-                "몸 가운데를 지정하세요."
-            )
+            jobs[job] = {
+                "status": "error",
+                "message":
+                "선수 검출 실패: 선수가 잘 보이는 장면에서 몸 가운데를 지정하세요."
+            }
+            return
 
         jobs[job] = {
-            "status": "completed",
+            "status": "done",
             "progress": 100,
-            "message": "분석이 완료되었습니다.",
             "video_url": f"/result/{job}"
         }
 
     except Exception as e:
         jobs[job] = {
-            "status": "failed",
-            "progress": 0,
+            "status": "error",
             "message": str(e)
         }
-
-    finally:
-        if cap is not None:
-            cap.release()
-
-        if writer is not None:
-            writer.release()
-
-        try:
-            if inp.exists():
-                inp.unlink()
-        except Exception:
-            pass
 
 
 @app.post("/analyze")
@@ -225,30 +222,29 @@ async def analyze(
     target_y: float = Form(...),
     target_time: float = Form(0)
 ):
-
     job = uuid.uuid4().hex
 
     inp = D / f"{job}.mp4"
     out = D / f"{job}_tracked.mp4"
 
-    contents = await video.read()
+    # 업로드 파일 저장
+    with open(inp, "wb") as f:
+        while True:
+            chunk = await video.read(1024 * 1024)
 
-    if not contents:
-        raise HTTPException(
-            400,
-            "업로드된 영상이 비어 있습니다."
-        )
+            if not chunk:
+                break
 
-    inp.write_bytes(contents)
+            f.write(chunk)
 
     jobs[job] = {
         "status": "queued",
-        "progress": 0,
-        "message": "분석 대기 중입니다."
+        "progress": 0
     }
 
+    # 분석은 별도 스레드에서 실행
     thread = threading.Thread(
-        target=process_video,
+        target=run_analysis,
         args=(
             job,
             inp,
@@ -262,22 +258,19 @@ async def analyze(
 
     thread.start()
 
+    # 기다리지 않고 즉시 응답
     return {
         "job": job,
         "status": "processing",
         "status_url": f"/status/{job}",
-        "message": "영상이 접수되었습니다. 분석을 진행합니다."
+        "result_url": f"/result/{job}"
     }
 
 
 @app.get("/status/{job}")
 def status(job: str):
-
     if job not in jobs:
-        raise HTTPException(
-            404,
-            "작업을 찾을 수 없습니다."
-        )
+        raise HTTPException(404, "작업을 찾을 수 없습니다.")
 
     return jobs[job]
 
@@ -285,29 +278,31 @@ def status(job: str):
 @app.get("/result/{job}")
 def result(job: str):
 
+    if job not in jobs:
+        raise HTTPException(404, "작업을 찾을 수 없습니다.")
+
+    state = jobs[job]
+
+    if state["status"] == "error":
+        raise HTTPException(
+            422,
+            state.get("message", "분석 실패")
+        )
+
+    if state["status"] != "done":
+        return {
+            "status": state["status"],
+            "progress": state.get("progress", 0),
+            "message": "아직 분석 중입니다."
+        }
+
     p = D / f"{job}_tracked.mp4"
 
-    if job in jobs:
-        if jobs[job]["status"] == "processing":
-            raise HTTPException(
-                202,
-                "아직 분석 중입니다."
-            )
-
-        if jobs[job]["status"] == "failed":
-            raise HTTPException(
-                422,
-                jobs[job]["message"]
-            )
-
     if not p.exists():
-        raise HTTPException(
-            404,
-            "결과 없음"
-        )
+        raise HTTPException(404, "결과 영상이 없습니다.")
 
     return FileResponse(
         p,
         media_type="video/mp4",
-        filename="football_ai_tracked.mp4"
+        filename="football_ai_26_tracked.mp4"
     )
